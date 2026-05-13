@@ -66,6 +66,9 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
 
         kernel_size = [self.temporal_patch_size, self.patch_size, self.patch_size]
         self.proj = nn.Conv3d(self.in_channels, self.embed_dim, kernel_size=kernel_size, stride=kernel_size, bias=True)
+        # Separate projection for global tokens: each 2×2 group of 16×16 patches is
+        # reconstructed into a 32×32 region, downsampled back to 16×16, then projected.
+        self.global_proj = nn.Conv3d(self.in_channels, self.embed_dim, kernel_size=kernel_size, stride=kernel_size, bias=True)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         target_dtype = self.proj.weight.dtype
@@ -74,6 +77,57 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
         )
         hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(-1, self.embed_dim)
         return hidden_states
+
+    def forward_global(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Compute one global embedding per 2×2 patch group (i.e. per 32×32 region).
+
+        The image processor outputs patches in block-major order so that every 4
+        consecutive patches form a spatial 2×2 block:
+            idx 0 → top-left     (h,   w  )
+            idx 1 → top-right    (h,   w+1)
+            idx 2 → bottom-left  (h+1, w  )
+            idx 3 → bottom-right (h+1, w+1)
+
+        We stitch the four 16×16 sub-patches into a 32×32 image, downsample to
+        16×16 with bilinear interpolation, and project through self.global_proj.
+
+        Args:
+            hidden_states: raw pixel data, shape
+                [N_total, in_channels * temporal_patch_size * patch_size * patch_size]
+        Returns:
+            global_embeds: shape [N_total // 4, embed_dim]
+        """
+        target_dtype = self.global_proj.weight.dtype
+        N = hidden_states.shape[0]
+        assert N % 4 == 0, "Total patch count must be divisible by 4 (spatial_merge_size²)"
+        G = N // 4  # number of 32×32 groups
+
+        # [N, C, T, P, P]
+        raw = hidden_states.view(N, self.in_channels, self.temporal_patch_size,
+                                 self.patch_size, self.patch_size)
+        # [G, 4, C, T, P, P]
+        raw = raw.view(G, 4, self.in_channels, self.temporal_patch_size,
+                       self.patch_size, self.patch_size)
+
+        # Stitch into 32×32: concat along width first, then along height
+        top    = torch.cat([raw[:, 0], raw[:, 1]], dim=-1)   # [G, C, T, P, 2P]
+        bottom = torch.cat([raw[:, 2], raw[:, 3]], dim=-1)   # [G, C, T, P, 2P]
+        merged = torch.cat([top, bottom], dim=-2)             # [G, C, T, 2P, 2P]
+
+        # Bilinear downsample 32×32 → 16×16
+        # Treat (C, T) jointly as the channel dim for F.interpolate
+        _, C, T_p, H_big, W_big = merged.shape
+        merged_2d = merged.view(G, C * T_p, H_big, W_big)
+        merged_down = F.interpolate(
+            merged_2d.float(),
+            size=(self.patch_size, self.patch_size),
+            mode="bilinear",
+            align_corners=False,
+        ).view(G, C, T_p, self.patch_size, self.patch_size)
+
+        # Project [G, C, T, P, P] → [G, embed_dim]
+        global_embeds = self.global_proj(merged_down.to(dtype=target_dtype)).view(-1, self.embed_dim)
+        return global_embeds
 
 
 class Qwen3VLVisionRotaryEmbedding(nn.Module):
@@ -91,9 +145,16 @@ class Qwen3VLVisionRotaryEmbedding(nn.Module):
 
 
 class Qwen3VLVisionPatchMerger(nn.Module):
-    def __init__(self, config: Qwen3VLVisionConfig, use_postshuffle_norm=False) -> None:
+    def __init__(self, config: Qwen3VLVisionConfig, use_postshuffle_norm=False,
+                 tokens_per_group: Optional[int] = None) -> None:
         super().__init__()
-        self.hidden_size = config.hidden_size * (config.spatial_merge_size**2)
+        # tokens_per_group: how many consecutive ViT tokens are merged into one output.
+        # Original: spatial_merge_size² = 4 (2×2 local sub-patches).
+        # With global token: spatial_merge_size² + 1 = 5 (4 local + 1 global).
+        if tokens_per_group is None:
+            tokens_per_group = config.spatial_merge_size ** 2
+        self.tokens_per_group = tokens_per_group
+        self.hidden_size = config.hidden_size * tokens_per_group
         self.use_postshuffle_norm = use_postshuffle_norm
         self.norm = nn.LayerNorm(self.hidden_size if use_postshuffle_norm else config.hidden_size, eps=1e-6)
         self.linear_fc1 = nn.Linear(self.hidden_size, self.hidden_size)
@@ -582,23 +643,54 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         self.rotary_pos_emb = Qwen3VLVisionRotaryEmbedding(head_dim // 2)
 
         self.blocks = nn.ModuleList([Qwen3VLVisionBlock(config) for _ in range(config.depth)])
-        self.merger = Qwen3VLVisionPatchMerger(
-            config=config,
-            use_postshuffle_norm=False,
-        )
+        self.merger = Qwen3VLVisionPatchMerger(config=config, use_postshuffle_norm=False)
 
         self.deepstack_visual_indexes = config.deepstack_visual_indexes
         self.deepstack_merger_list = nn.ModuleList(
             [
-                Qwen3VLVisionPatchMerger(
-                    config=config,
-                    use_postshuffle_norm=True,
-                )
+                Qwen3VLVisionPatchMerger(config=config, use_postshuffle_norm=True)
                 for _ in range(len(config.deepstack_visual_indexes))
             ]
         )
 
+        # Learnable gate scalars for folding x5 back into x1-x4.
+        # One per fold point: len(deepstack_visual_indexes) folds + 1 final fold.
+        # Init 0.01 so the fold path has non-zero gradient from the start.
+        n_folds = len(config.deepstack_visual_indexes) + 1
+        self.fold_gates = nn.ParameterList(
+            [nn.Parameter(torch.tensor(0.01)) for _ in range(n_folds)]
+        )
+
         self.gradient_checkpointing = False
+
+    def _fold_global(
+        self, hidden_states: torch.Tensor, gate: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fold x5 into x1-x4 with gated addition and remove x5 from the sequence.
+
+        Input:  [5N/4, D]  (groups of 5: x1 x2 x3 x4 x5)
+        Output: ([N, D], x5_saved [N/4, D])
+        """
+        total, D = hidden_states.shape
+        G = total // 5
+        grouped = hidden_states.view(G, 5, D)
+        x5 = grouped[:, 4, :]                                    # [G, D]
+        x_local = grouped[:, :4, :] + gate * x5.unsqueeze(1)    # [G, 4, D]
+        return x_local.reshape(G * 4, D), x5
+
+    def _insert_global(
+        self, hidden_states: torch.Tensor, x5: torch.Tensor
+    ) -> torch.Tensor:
+        """Re-insert a saved x5 tensor to rebuild the 5N/4 token sequence.
+
+        Input:  hidden_states [N, D], x5 [N/4, D]
+        Output: [5N/4, D]  (groups of 5: x1 x2 x3 x4 x5)
+        """
+        N, D = hidden_states.shape
+        G = N // 4
+        local = hidden_states.view(G, 4, D)
+        combined = torch.cat([local, x5.view(G, 1, D)], dim=1)  # [G, 5, D]
+        return combined.reshape(G * 5, D)
 
     def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
         merge_size = self.spatial_merge_size
@@ -710,21 +802,63 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
 
         Returns:
             `torch.Tensor`: hidden_states.
-        """
-        hidden_states = self.patch_embed(hidden_states)
 
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+        Architecture note — global token injection
+        ------------------------------------------
+        Each 32×32 region (= one 2×2 block of 16×16 patches) produces 5 ViT tokens:
+            [local_TL, local_TR, local_BL, local_BR, global]
+        where `global` is the 32×32 patch bilinearly downsampled to 16×16 and
+        projected through patch_embed.global_proj.
+
+        The sequence runs at 5N/4 through all ViT blocks.  Before each DeepStack
+        extraction (and once more at the end), x5 is folded back into x1-x4 via
+        gated addition (`x_i = x_i + α_k * x5`) and removed, restoring the N-token
+        sequence that the PatchMerger (tokens_per_group=4) and downstream LLM expect.
+        """
+        # ── 1. Local patch embeddings ─────────────────────────────────────────────
+        local_embeds = self.patch_embed(hidden_states)           # [N, D]
+
+        # ── 2. Global patch embeddings (one per 2×2 / 32×32 block) ───────────────
+        global_embeds = self.patch_embed.forward_global(hidden_states)  # [N//4, D]
+
+        # ── 3. Interleave: [local×4, global] per group → [5N/4, D] ──────────────
+        N, D = local_embeds.shape
+        G = N // 4
+        local_grouped  = local_embeds.view(G, 4, D)              # [G, 4, D]
+        global_grouped = global_embeds.unsqueeze(1)               # [G, 1, D]
+        combined = torch.cat([local_grouped, global_grouped], dim=1)   # [G, 5, D]
+        hidden_states = combined.view(G * 5, D)                   # [5N/4, D]
+
+        # ── 4. Positional embeddings (fast bilinear-interpolated) ─────────────────
+        # fast_pos_embed_interpolate already returns block-major order → group by 4,
+        # average to get the centre position of each 32×32 block as the global pos.
+        local_pos = self.fast_pos_embed_interpolate(grid_thw)    # [N, D]
+        local_pos_grouped = local_pos.view(G, 4, D)
+        global_pos = local_pos_grouped.mean(dim=1, keepdim=True)  # [G, 1, D]
+        pos_embeds = torch.cat([local_pos_grouped, global_pos], dim=1).view(G * 5, D)
         hidden_states = hidden_states + pos_embeds
 
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        # ── 5. Rotary position embeddings ─────────────────────────────────────────
+        # rot_pos_emb returns per-patch (row,col) frequencies in block-major order.
+        # Global token gets the average (= block centre) frequency.
+        local_rpe = self.rot_pos_emb(grid_thw)                   # [N, head_dim]
+        head_dim = local_rpe.shape[-1]
+        local_rpe_grouped = local_rpe.view(G, 4, head_dim)
+        global_rpe = local_rpe_grouped.mean(dim=1, keepdim=True)  # [G, 1, head_dim]
+        rotary_pos_emb = torch.cat([local_rpe_grouped, global_rpe], dim=1).view(G * 5, head_dim)
 
-        seq_len, _ = hidden_states.size()
-        hidden_states = hidden_states.reshape(seq_len, -1)
+        seq_len = hidden_states.shape[0]
+        hidden_states  = hidden_states.reshape(seq_len, -1)
         rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
 
-        cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
+        # ── 6. cu_seqlens: update sequence-length boundaries ─────────────────────
+        # Original: H*W tokens per temporal frame.
+        # New:      H*W + H*W//4 = 5*H*W//4 tokens per temporal frame.
+        # (H*W is always divisible by 4 since H,W are multiples of spatial_merge_size=2)
+        tokens_per_frame = grid_thw[:, 1] * grid_thw[:, 2] * 5 // 4
+        cu_seqlens = torch.repeat_interleave(tokens_per_frame, grid_thw[:, 0]).cumsum(
             dim=0,
             # Select dtype based on the following factors:
             #  - FA2 requires that cu_seqlens_q must have dtype int32
@@ -734,7 +868,12 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
+        # ── 7. ViT blocks with fold-insert at each DeepStack extraction point ───
+        # cu_seqlens and position_embeddings are 5N/4-based and stay fixed throughout.
+        # Fold temporarily reduces sequence to N for DeepStack extraction, then
+        # re-insert restores 5N/4 before the next block runs.
         deepstack_feature_lists = []
+        fold_idx = 0
         for layer_num, blk in enumerate(self.blocks):
             hidden_states = blk(
                 hidden_states,
@@ -743,11 +882,17 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
                 **kwargs,
             )
             if layer_num in self.deepstack_visual_indexes:
-                deepstack_feature = self.deepstack_merger_list[self.deepstack_visual_indexes.index(layer_num)](
-                    hidden_states
-                )
+                ds_idx = self.deepstack_visual_indexes.index(layer_num)
+                hidden_states, x5_saved = self._fold_global(hidden_states, self.fold_gates[fold_idx])
+                fold_idx += 1
+                deepstack_feature = self.deepstack_merger_list[ds_idx](hidden_states)
                 deepstack_feature_lists.append(deepstack_feature)
+                hidden_states = self._insert_global(hidden_states, x5_saved)
 
+        # ── 8. Final fold: restore N-token sequence before merger ─────────────────
+        hidden_states, _ = self._fold_global(hidden_states, self.fold_gates[fold_idx])
+
+        # ── 9. Merge N tokens → N/4 output tokens ────────────────────────────────
         hidden_states = self.merger(hidden_states)
 
         return hidden_states, deepstack_feature_lists
@@ -1552,10 +1697,79 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         return input_ids, model_kwargs
 
 
+def adapt_weights_for_global_token(model: "Qwen3VLForConditionalGeneration",
+                                    pretrained_model_name_or_path: str) -> None:
+    """Initialise the new global-token weights from the pretrained checkpoint.
+
+    Call this immediately after::
+
+        model = Qwen3VLForConditionalGeneration.from_pretrained(
+            path, ..., ignore_mismatched_sizes=True
+        )
+        adapt_weights_for_global_token(model, path)
+
+    Only one layer needs initialisation:
+
+    visual.patch_embed.global_proj  (NEW Conv3d)
+        Copied from visual.patch_embed.proj so that x5 starts as a legitimate
+        16×16 patch embedding.  fold_gates are nn.Parameters initialised to
+        0.01 inside __init__ and need no special treatment here.
+
+    All other layers (merger, deepstack_merger_list) are unchanged: the
+    fold-back design restores the N-token sequence before the merger sees it,
+    so those weight shapes are identical to the pretrained checkpoint.
+    """
+    import json
+    import os
+    import glob as _glob
+
+    # ── load pretrained weights ───────────────────────────────────────────────
+    pt: dict[str, torch.Tensor] = {}
+    index_path = os.path.join(pretrained_model_name_or_path, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            weight_map: dict[str, str] = json.load(f)["weight_map"]
+        shard_cache: dict[str, dict] = {}
+        for key, shard_name in weight_map.items():
+            shard_path = os.path.join(pretrained_model_name_or_path, shard_name)
+            if shard_path not in shard_cache:
+                from safetensors.torch import load_file
+                shard_cache[shard_path] = load_file(shard_path, device="cpu")
+            pt[key] = shard_cache[shard_path][key]
+    else:
+        sf = os.path.join(pretrained_model_name_or_path, "model.safetensors")
+        if os.path.exists(sf):
+            from safetensors.torch import load_file
+            pt = load_file(sf, device="cpu")
+        else:
+            for bf in _glob.glob(os.path.join(pretrained_model_name_or_path, "pytorch_model*.bin")):
+                pt.update(torch.load(bf, map_location="cpu"))
+
+    def _copy_into(param: nn.Parameter, new_data: torch.Tensor) -> None:
+        with torch.no_grad():
+            param.copy_(new_data.to(dtype=param.dtype, device=param.device))
+
+    vis = model.visual
+
+    # Auto-detect checkpoint key prefix (may be "visual." or "model.visual.")
+    probe = "visual.patch_embed.proj.weight"
+    pfx = "model.visual" if f"model.{probe}" in pt else "visual"
+
+    # ── global_proj: copy from proj ───────────────────────────────────────────
+    for attr in ("weight", "bias"):
+        key = f"{pfx}.patch_embed.proj.{attr}"
+        if key in pt:
+            _copy_into(getattr(vis.patch_embed.global_proj, attr), pt[key].clone())
+
+    del pt
+    print("[adapt_weights_for_global_token] weight adaptation complete.")
+
+
 __all__ = [
     "Qwen3VLVisionModel",
     "Qwen3VLForConditionalGeneration",
     "Qwen3VLModel",
     "Qwen3VLPreTrainedModel",
     "Qwen3VLTextModel",
+    "adapt_weights_for_global_token",
 ]

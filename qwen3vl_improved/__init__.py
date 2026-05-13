@@ -20,6 +20,7 @@ from .modeling_qwen3_vl import (
     Qwen3VLVisionModel,
     Qwen3VLModelOutputWithPast,
     Qwen3VLCausalLMOutputWithPast,
+    adapt_weights_for_global_token,
 )
 from .processing_qwen3_vl import Qwen3VLProcessor
 from .video_processing_qwen3_vl import Qwen3VLVideoProcessor
